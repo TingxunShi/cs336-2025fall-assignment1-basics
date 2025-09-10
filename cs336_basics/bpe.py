@@ -10,26 +10,39 @@ from .pretokenization_example import find_chunk_boundaries
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
 
-def split_by_special_token_and_pre_tokenize(
+def process_chunk(
     input_path: str,
     start: int,
     end: int,
     special_tokens: list[str],
-) -> dict[bytes, int]:
-    special_token_patterns = '|'.join(re.escape(t) for t in special_tokens)
-    counts = Counter()
-
+    keep_special_tokens: bool = False,
+) -> list[bytes]:
     with open(input_path, 'rb') as f:
         f.seek(start)
         current_chunk = f.read(end - start).decode("utf-8", errors="ignore")
-        spans = re.split(special_token_patterns, current_chunk)
-        for span in spans:
-            if not span:
-                continue
+
+    spans = split_chunk_by_special_tokens(current_chunk, special_tokens)
+    return pre_tokenize(spans, special_tokens, keep_special_tokens)
+
+def split_chunk_by_special_tokens(current_chunk: str, special_tokens: list[str]) -> list[str]:
+    special_tokens = sorted(special_tokens, key=len, reverse=True)
+    special_token_patterns = '(' + '|'.join(re.escape(t) for t in special_tokens) + ')'
+    spans = re.split(special_token_patterns, current_chunk)
+    return spans
+
+def pre_tokenize(spans: list[str], special_tokens: list[str], keep_special_tokens: bool = False) -> list[bytes]:
+    pre_tokens = []
+    for span in spans:
+        if not span:
+            continue
+        if span in special_tokens:
+            if keep_special_tokens:
+                pre_tokens.append(span.encode("utf-8"))
+        else:
             for match in re.finditer(PAT, span):
                 token = match.group(0)
-                counts[token.encode('utf-8')] += 1
-    return counts
+                pre_tokens.append(token.encode("utf-8"))
+    return pre_tokens
 
 def merge_pair_in_tuple_token(old_token: tuple[bytes], pair: tuple[bytes]) -> tuple[bytes]:
     new_token_parts = []
@@ -71,10 +84,10 @@ def train_bpe(
     process_args = [(input_path, start, end, special_tokens)
                     for start, end in zip(boundaries[:-1], boundaries[1:])]
     with Pool(num_processes) as pool:
-        chunk_counts = pool.starmap(split_by_special_token_and_pre_tokenize, process_args)
+        pre_tokenized_chunks = pool.starmap(process_chunk, process_args)
     total_counts = Counter()
-    for chunk_counter in chunk_counts:
-        total_counts.update(chunk_counter)
+    for chunk_pre_tokens in pre_tokenized_chunks:
+        total_counts.update(Counter(chunk_pre_tokens))
 
     pair_counts = Counter()
     word_freqs = Counter()
@@ -117,21 +130,73 @@ class Tokenizer():
         special_tokens: list[str] | None = None
     ):
         self.vocab = vocab
+        self.reverse_vocab = {v: k for k, v in vocab.items()}
         self.merges = merges
-        self.special_tokens = special_tokens if special_tokens else []
+        self.merges_dict = {token_pair: i for i, token_pair in enumerate(merges)}
+        self.special_tokens = special_tokens if special_tokens else ['<|endoftext|>']
+        self.special_tokens_set = set([st.encode('utf-8') for st in self.special_tokens])
 
     @classmethod
     def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens: list[str] | None = None):
         raise NotImplementedError()
 
     def encode(self, text: str) -> list[int]:
-        ...
+        spans = split_chunk_by_special_tokens(text, self.special_tokens)
+        pre_tokens = pre_tokenize(spans, self.special_tokens, keep_special_tokens=True)
+        token_ids = []
+        for pre_token in pre_tokens:
+            if pre_token in self.special_tokens_set:
+                token_ids.append(self.reverse_vocab[pre_token])
+                continue
+            cur_tokens = [pre_token[i: i + 1] for i in range(len(pre_token))]
+
+            while True:
+                best_pair_info = {'rank': float('inf'), 'pair': None, 'idx': -1}
+
+                for i in range(len(cur_tokens) - 1):
+                    pair = (cur_tokens[i], cur_tokens[i + 1])
+                    rank = self.merges_dict.get(pair, None)
+                    if rank is not None and rank < best_pair_info['rank']:
+                        best_pair_info['rank'] = rank
+                        best_pair_info['pair'] = pair
+                        best_pair_info['idx'] = i
+
+                if best_pair_info['pair'] is None:
+                    break
+
+                best_idx = best_pair_info['idx']
+                best_pair = best_pair_info['pair']
+                cur_tokens = cur_tokens[:best_idx] + [best_pair[0] + best_pair[1]] + cur_tokens[best_idx + 2:]
+
+            for token in cur_tokens:
+                token_ids.append(self.reverse_vocab[token])
+        return token_ids
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
-        ...
+        boundary_token = '<|endoftext|>'
+        buffer = ''
+
+        for chunk in iterable:
+            buffered_chunk = buffer + chunk
+            parts = buffered_chunk.split(boundary_token)
+
+            for i, part in enumerate(parts[:-1]):
+                text_to_encode = part + boundary_token
+                yield from self.encode(text_to_encode)
+
+            buffer = parts[-1]
+
+        if buffer:
+            yield from self.encode(buffer)
 
     def decode(self, ids: list[int]) -> str:
-        ...
+        byte_chunks = []
+        for token_id in ids:
+            if token_id in self.vocab:
+                byte_chunks.append(self.vocab[token_id])
+
+        all_bytes = b''.join(byte_chunks)
+        return all_bytes.decode('utf-8', errors='replace')
 
 
 if __name__ == '__main__':
