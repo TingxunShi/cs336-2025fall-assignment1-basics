@@ -1,13 +1,59 @@
+import os
 import regex as re
 
-from collections import Counter
+from collections import Counter, defaultdict
 from multiprocessing import Pool
-from typing import Iterator, Iterable\
-
-from .pretokenization_example import find_chunk_boundaries
+from typing import BinaryIO, Iterator, Iterable
 
 
 PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+
+def find_chunk_boundaries(
+    file: BinaryIO,
+    desired_num_chunks: int,
+    split_special_token: bytes,
+) -> list[int]:
+    """
+    Chunk the file into parts that can be counted independently.
+    May return fewer chunks if the boundaries end up overlapping.
+    """
+    assert isinstance(split_special_token, bytes), "Must represent special token as a bytestring"
+
+    # Get total file size in bytes
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
+
+    chunk_size = file_size // desired_num_chunks
+
+    # Initial guesses for chunk boundary locations, uniformly spaced
+    # Chunks start on previous index, don't include last index
+    chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
+    chunk_boundaries[-1] = file_size
+
+    mini_chunk_size = 4096  # Read ahead by 4k bytes at a time
+
+    for bi in range(1, len(chunk_boundaries) - 1):
+        initial_position = chunk_boundaries[bi]
+        file.seek(initial_position)  # Start at boundary guess
+        while True:
+            mini_chunk = file.read(mini_chunk_size)  # Read a mini chunk
+
+            # If EOF, this boundary should be at the end of the file
+            if mini_chunk == b"":
+                chunk_boundaries[bi] = file_size
+                break
+
+            # Find the special token in the mini chunk
+            found_at = mini_chunk.find(split_special_token)
+            if found_at != -1:
+                chunk_boundaries[bi] = initial_position + found_at
+                break
+            initial_position += mini_chunk_size
+
+    # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
+    return sorted(set(chunk_boundaries))
 
 
 def process_chunk(
@@ -91,6 +137,7 @@ def train_bpe(
 
     pair_counts = Counter()
     word_freqs = Counter()
+    pair2word_map = defaultdict(set)
     for byte_token, count in total_counts.items():
         word_tuple = tuple(byte_token[i: i + 1] for i in range(len(byte_token)))
         word_freqs[word_tuple] = count
@@ -98,6 +145,7 @@ def train_bpe(
         for i in range(len(word) - 1):
             cur_pair = (word[i], word[i + 1])
             pair_counts[cur_pair] += count
+            pair2word_map[cur_pair].add(word)
 
     while len(vocab) < vocab_size and pair_counts:
         top_pair = max(pair_counts, key=lambda pair: (pair_counts[pair], pair))
@@ -105,20 +153,40 @@ def train_bpe(
         vocab[cur_id] = top_pair[0] + top_pair[1]
         cur_id += 1
 
-        for word, freq in list(word_freqs.items()):
-            for i in range(len(word) - 1):
-                cur_pair = (word[i], word[i + 1])
+        changes = []
+        affected_words = list(pair2word_map[top_pair])
+        for word in affected_words:
+            freq = word_freqs[word]
+            new_word = merge_pair_in_tuple_token(word, top_pair)
+            changes.append({'old': word, 'new': new_word, 'freq': freq})
+
+        for change in changes:
+            old_word = change['old']
+            new_word = change['new']
+            freq = change['freq']
+
+            if old_word not in word_freqs:
+                continue
+
+            for i in range(len(old_word) - 1):
+                cur_pair = (old_word[i], old_word[i + 1])
                 pair_counts[cur_pair] -= freq
                 if pair_counts[cur_pair] == 0:
                     del pair_counts[cur_pair]
-            new_word = merge_pair_in_tuple_token(word, top_pair)
-            word_freqs[word] -= freq
-            if word_freqs[word] == 0:
-                del word_freqs[word]
+                if cur_pair in pair2word_map and old_word in pair2word_map[cur_pair]:
+                    pair2word_map[cur_pair].remove(old_word)
+                    if not pair2word_map[cur_pair]:
+                        del pair2word_map[cur_pair]
+
+            word_freqs[old_word] -= freq
+            if word_freqs[old_word] == 0:
+                del word_freqs[old_word]
             word_freqs[new_word] += freq
+
             for i in range(len(new_word) - 1):
                 cur_pair = (new_word[i], new_word[i + 1])
                 pair_counts[cur_pair] += freq
+                pair2word_map[cur_pair].add(new_word)
 
     return vocab, merges
 
@@ -151,17 +219,17 @@ class Tokenizer():
             cur_tokens = [pre_token[i: i + 1] for i in range(len(pre_token))]
 
             while True:
-                best_pair_info = {'rank': float('inf'), 'pair': None, 'idx': -1}
+                best_pair_info = {'rank': float('inf'), 'pair': (b'', b''), 'idx': -1}
 
                 for i in range(len(cur_tokens) - 1):
                     pair = (cur_tokens[i], cur_tokens[i + 1])
-                    rank = self.merges_dict.get(pair, None)
+                    rank = self.merges_dict.get(pair)
                     if rank is not None and rank < best_pair_info['rank']:
                         best_pair_info['rank'] = rank
                         best_pair_info['pair'] = pair
                         best_pair_info['idx'] = i
 
-                if best_pair_info['pair'] is None:
+                if best_pair_info['pair'] == (b'', b''):
                     break
 
                 best_idx = best_pair_info['idx']
@@ -197,7 +265,3 @@ class Tokenizer():
 
         all_bytes = b''.join(byte_chunks)
         return all_bytes.decode('utf-8', errors='replace')
-
-
-if __name__ == '__main__':
-    print(train_bpe('../tests/fixtures/tiny_text.txt', 263))
