@@ -18,6 +18,14 @@ def softmax(x: Tensor, dim: int) -> Tensor:
     return x_exp / torch.sum(x_exp, dim=dim, keepdim=True)
 
 
+def scaled_dot_product_attention(q: Tensor, k: Tensor, v: Tensor, mask: Tensor | None = None) -> Tensor:
+    d = q.size(-1)
+    qk = einsum(q, k, 'b ... t1 d, b ... t2 d -> b ... t1 t2') / (d ** 0.5)
+    if mask is not None:
+        qk.masked_fill_(~mask, -math.inf)
+    return einsum(softmax(qk, -1), v, 'b ... t1 t2, b ... t2 d -> b ... t1 d')
+
+
 class Linear(nn.Module):
     def __init__(
             self,
@@ -152,3 +160,51 @@ class RotaryPositionalEmbedding(nn.Module):
         x_out = x_rotated.view(*ori_shape, seq_len, d_k)
 
         return x_out.to(x.dtype)
+
+
+class MultiHeadAttention(nn.Module):
+    def __init__(
+            self,
+            d_model: int,
+            num_heads: int,
+            rope: RotaryPositionalEmbedding | None = None,
+            device: torch.device | None = None,
+            dtype: torch.dtype | None = None
+    ):
+        super().__init__()
+        self.rope = rope
+        self.dim_head = d_model // num_heads
+        self.num_heads = num_heads
+        self.QKV = Linear(d_model, d_model * 3, device=device, dtype=dtype)
+        self.O = Linear(d_model, d_model, device=device, dtype=dtype)
+
+    def forward(
+            self,
+            x: Tensor,
+            mask: Tensor | None = None,
+            need_mask: bool = True,
+            token_positions: Tensor | None = None,
+    ) -> Tensor:
+        batch_size, seq_len, d_model = x.shape
+        qkv = self.QKV(x)
+
+        q, k, v = torch.chunk(qkv, chunks=3, dim=-1)
+
+        q_out = rearrange(q, 'b t (h dh) -> b h t dh', h=self.num_heads, dh=self.dim_head)
+        k_out = rearrange(k, 'b t (h dh) -> b h t dh', h=self.num_heads, dh=self.dim_head)
+        v_out = rearrange(v, 'b t (h dh) -> b h t dh', h=self.num_heads, dh=self.dim_head)
+
+        if self.rope is not None:
+            q_out = self.rope(q_out, token_positions)
+            k_out = self.rope(k_out, token_positions)
+
+        if need_mask and mask is None:
+            mask = torch.triu(torch.ones(seq_len, seq_len, device=x.device), diagonal=1).bool()
+            mask = rearrange(mask, 't1 t2 -> 1 1 t1 t2')
+            mask = ~mask
+        if not need_mask and mask is not None:
+            mask = None
+
+        mha = scaled_dot_product_attention(q_out, k_out, v_out, mask)
+        mha = rearrange(mha, 'b h t dh -> b t (h dh)')
+        return self.O(mha)
