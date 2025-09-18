@@ -195,13 +195,14 @@ class MultiHeadAttention(nn.Module):
         v_out = rearrange(v, 'b t (h dh) -> b h t dh', h=self.num_heads, dh=self.dim_head)
 
         if self.rope is not None:
+            if token_positions is None:
+                token_positions = torch.arange(seq_len, device=x.device)
             q_out = self.rope(q_out, token_positions)
             k_out = self.rope(k_out, token_positions)
 
         if need_mask and mask is None:
-            mask = torch.triu(torch.ones(seq_len, seq_len, device=x.device), diagonal=1).bool()
+            mask = torch.tril(torch.ones(seq_len, seq_len, device=x.device), diagonal=0).bool()
             mask = rearrange(mask, 't1 t2 -> 1 1 t1 t2')
-            mask = ~mask
         if not need_mask and mask is not None:
             mask = None
 
