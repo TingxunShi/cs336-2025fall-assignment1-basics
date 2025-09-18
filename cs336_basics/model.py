@@ -1,6 +1,6 @@
 from torch import nn, Tensor
 
-from .modules import Embedding, Linear, MultiHeadAttention, RMSNorm, RotaryPositionalEmbedding, SwiGLU
+from .module import Embedding, Linear, MultiHeadAttention, RMSNorm, RotaryPositionalEmbedding, SwiGLU
 
 
 class TransformerBlock(nn.Module):
